@@ -10,7 +10,6 @@ mod tests {
     use std::num::NonZeroUsize;
     use std::time::Instant;
 
-    // this doesnt even run idk
     #[test]
     fn convert() {
         let file_name = "music.wav";

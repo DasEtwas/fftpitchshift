@@ -142,7 +142,7 @@ impl PitchShifter {
             self.synthesized_frequency.fill(0.0);
 
             for k in 0..half_frame_size {
-                let index = (k as f32 * self.pitch).round() as usize;
+                let index = (k as f32 * self.pitch).floor() as usize;
                 if index < half_frame_size {
                     let ft = self.fft_workspace[k];
                     let phase = ft.im.atan2(ft.re);
