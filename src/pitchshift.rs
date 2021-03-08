@@ -44,10 +44,9 @@ impl PitchShifter {
         sample_rate: u32,
         over_sampling: NonZeroUsize,
         pitch: f32,
+        window: Vec<f32>,
     ) -> Self {
-        let mut window = vec![0.0; frame_size];
-
-        Self::generate_blackman_harris(&mut window);
+        assert_eq!(window.len(), frame_size);
 
         Self {
             input_buffer: vec![0.0; frame_size],
@@ -76,23 +75,6 @@ impl PitchShifter {
 
     pub fn latency(&self) -> usize {
         self.frame_size - self.frame_size / self.over_sampling
-    }
-
-    //https://stackoverflow.com/a/10663313
-    fn generate_blackman_harris(output: &mut [f32]) {
-        const A0: f32 = 0.35875;
-        const A1: f32 = 0.48829;
-        const A2: f32 = 0.14128;
-        const A3: f32 = 0.01168;
-
-        let len_m1 = (output.len() - 1) as f32;
-
-        output.iter_mut().enumerate().for_each(|(idx, f)| {
-            let idx = idx as f32;
-            *f = A0 - (A1 * f32::cos((2.0 * std::f32::consts::PI * idx) / len_m1))
-                + (A2 * f32::cos((4.0 * std::f32::consts::PI * idx) / len_m1))
-                - (A3 * f32::cos((6.0 * std::f32::consts::PI * idx) / len_m1))
-        });
     }
 
     // https://blogs.zynaptiq.com/bernsee/pitch-shifting-using-the-ft/

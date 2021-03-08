@@ -61,6 +61,8 @@ mod tests {
                     spec.sample_rate,
                     NonZeroUsize::new(8).unwrap(),
                     pitch_shift_factor / speed_factor,
+                    // rectangular window, causes audible crackling (use something else)
+                    vec![1.0; frame_size]
                 );
                 spec.channels as usize
             ];
