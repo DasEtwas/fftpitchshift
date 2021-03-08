@@ -32,8 +32,13 @@ pub struct PitchShifter {
 impl PitchShifter {
     /// * `frame_size`: FFT size, 2048 should be reasonable for music.
     /// * `sample_rate`: Audio sample rate, e.g. 48000hz
-    /// * `over_sampling`: Non-zero divisor of `frame_size`, indirectly sets the analysis frame step length. `step = frame_size / over_sampling`. This step is also the frame overlap.
+    /// * `over_sampling`: Non-zero divisor of `frame_size` e.g. 8, indirectly sets the analysis frame step length. `step = frame_size / over_sampling`. This step is also the frame overlap. Note that this setting has the most impact on the algorithm's run time.
     /// * `pitch`: Pitch factor. >1.0 values result in a higher tone.
+    ///
+    /// When determining `frame_size` and `over_sampling`, note that the Short-Time Fourier Transform may not be longer than dozens of milliseconds or the
+    /// sound is audibly "smeared". The step `step = frame_size / over_sampling` can be used as a proxy to approximate smearing of otuput audio, as it is the number of samples
+    /// it takes for the next STFT to begin. For example, `frame_size = 16384, oversampling = 8` causes smearing while `frame_size = 1024, oversampling = 8` does not. A lower step value
+    /// is therefore recommended.
     pub fn new(
         frame_size: usize,
         sample_rate: u32,
@@ -142,7 +147,7 @@ impl PitchShifter {
             self.synthesized_frequency.fill(0.0);
 
             for k in 0..half_frame_size {
-                let index = (k as f32 * self.pitch).floor() as usize;
+                let index = (k as f32 * self.pitch).round() as usize;
                 if index < half_frame_size {
                     let ft = self.fft_workspace[k];
                     let phase = ft.im.atan2(ft.re);
