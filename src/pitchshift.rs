@@ -15,6 +15,7 @@ pub struct PitchShifter {
     last_phase: Vec<f32>,
     phase_sum: Vec<f32>,
     window: Vec<f32>,
+    mix_window: Vec<f32>,
     synthesized_frequency: Vec<f32>,
     synthesized_magnitude: Vec<f32>,
     frame_size: usize,
@@ -34,6 +35,8 @@ impl PitchShifter {
     /// * `sample_rate`: Audio sample rate, e.g. 48000hz
     /// * `over_sampling`: Non-zero divisor of `frame_size` e.g. 8, indirectly sets the analysis frame step length. `step = frame_size / over_sampling`. This step is also the frame overlap. Note that this setting has the most impact on the algorithm's run time.
     /// * `pitch`: Pitch factor. >1.0 values result in a higher tone.
+    /// * `window`: FFT windowing function. Has to be `frame_size` values in length.
+    /// * `mix_window`: Frame mixing function. Has to be `frame_size` values in length.
     ///
     /// When determining `frame_size` and `over_sampling`, note that the Short-Time Fourier Transform may not be longer than dozens of milliseconds or the
     /// sound is audibly "smeared". The step `step = frame_size / over_sampling` can be used as a proxy to approximate smearing of otuput audio, as it is the number of samples
@@ -45,13 +48,16 @@ impl PitchShifter {
         over_sampling: NonZeroUsize,
         pitch: f32,
         window: Vec<f32>,
+        mix_window: Vec<f32>,
     ) -> Self {
         assert_eq!(window.len(), frame_size);
+        assert_eq!(mix_window.len(), frame_size);
 
         Self {
             input_buffer: vec![0.0; frame_size],
             output_buffer: vec![0.0; frame_size],
             window,
+            mix_window,
             fft_workspace: vec![Complex32::default(); frame_size],
             last_phase: vec![0.0; frame_size / 2 + 1],
             phase_sum: vec![0.0; frame_size / 2 + 1],
@@ -172,7 +178,7 @@ impl PitchShifter {
 
             self.output_buffer[self.audio_index..self.audio_index + self.frame_size]
                 .iter_mut()
-                .zip(self.window.iter())
+                .zip(self.mix_window.iter())
                 .zip(self.fft_workspace.iter())
                 .for_each(|((output, window), ifft)| {
                     *output += window * ifft.re * acc_oversampling
