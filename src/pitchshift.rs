@@ -75,6 +75,14 @@ impl PitchShifter {
         }
     }
 
+    pub fn phase_sum(&self) -> &[f32] {
+        self.phase_sum.as_slice()
+    }
+
+    pub fn phase_sum_mut(&mut self) -> &mut [f32] {
+        self.phase_sum.as_mut_slice()
+    }
+
     pub fn frame_size(&self) -> usize {
         self.frame_size
     }
@@ -158,8 +166,9 @@ impl PitchShifter {
             }
 
             for k in 0..half_frame_size {
-                self.phase_sum[k] += mean_expected * self.synthesized_frequency[k];
-                let phase = self.phase_sum[k];
+                let phase = self.phase_sum[k] + mean_expected * self.synthesized_frequency[k];
+                self.phase_sum[k] = phase.rem_euclid(std::f32::consts::TAU);
+
                 let magnitude = self.synthesized_magnitude[k] * eq[k];
                 let (im, re) = phase.sin_cos();
 
