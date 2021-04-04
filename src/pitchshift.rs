@@ -253,14 +253,14 @@ impl PitchShifter {
                     .collect()
             }
 
-            println!(
+            /*println!(
                 "0hz phase: {}, delta phase sum: {} soos {}#",
                 asciiboner(32, (self.phase_sum[0] / TAU * 31.9) as usize),
                 asciiboner(50, (dps / 1000.0 * 49.9) as usize),
                 (0..(self.phase_sum.iter().sum::<f32>() / 5000.0 * 30.0) as usize)
                     .map(|_| ' ')
                     .collect::<String>()
-            );
+            );*/
 
             // https://www.dsprelated.com/freebooks/sasp/fourier_transforms_continuous_discrete_time_frequency.html
             // "Symmetry of the DTFT for Real Signals"
