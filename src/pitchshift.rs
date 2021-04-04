@@ -7,6 +7,8 @@ use std::sync::Arc;
 /// Uses the Fast Fourier Transform and frequency-domain magic to change the pitch of an audio stream.
 ///
 /// Port of [this C implementation](https://github.com/cpuimage/pitchshift/) of [this article](https://blogs.zynaptiq.com/bernsee/pitch-shifting-using-the-ft/).
+///
+/// Methods used: constant overlap-add (COLA) adding to an output buffer from the inverse FFT of a frequency-domain scaled signal.
 #[derive(Clone)]
 pub struct PitchShifter {
     input_buffer: Vec<f32>,
@@ -53,16 +55,18 @@ impl PitchShifter {
         assert_eq!(window.len(), frame_size);
         assert_eq!(mix_window.len(), frame_size);
 
+        let half_framesize = frame_size / 2 + 1;
+
         Self {
             input_buffer: vec![0.0; frame_size],
             output_buffer: vec![0.0; frame_size],
             window,
             mix_window,
             fft_workspace: vec![Complex32::default(); frame_size],
-            last_phase: vec![0.0; frame_size / 2 + 1],
-            phase_sum: vec![0.0; frame_size / 2 + 1],
-            synthesized_frequency: vec![0.0; frame_size],
-            synthesized_magnitude: vec![0.0; frame_size],
+            last_phase: vec![0.0; half_framesize],
+            phase_sum: vec![0.0; half_framesize],
+            synthesized_frequency: vec![0.0; half_framesize],
+            synthesized_magnitude: vec![0.0; half_framesize],
             frame_size,
             step: frame_size / over_sampling.get(),
             over_sampling: over_sampling.get(),
@@ -143,23 +147,28 @@ impl PitchShifter {
             self.synthesized_frequency.fill(0.0);
 
             for k in 0..half_frame_size {
-                let index = (k as f32 * self.pitch).round() as usize;
+                let findex = k as f32 * self.pitch;
+                let fract = findex.fract();
+                let index = findex.floor() as usize;
                 if index < half_frame_size {
                     let ft = self.fft_workspace[k];
                     let phase = ft.im.atan2(ft.re);
                     // phase difference from last round
-                    let mut delta_phase = (phase - self.last_phase[k]) - k as f32 * expected;
-                    let mut qpd = (delta_phase / PI) as i32;
-                    if qpd >= 0 {
-                        qpd += qpd & 1;
-                    } else {
-                        qpd -= qpd & 1;
-                    }
-                    delta_phase -= PI * qpd as f32;
+                    let delta_phase = phase - self.last_phase[k] - k as f32 * expected;
+
                     self.last_phase[k] = phase;
-                    self.synthesized_magnitude[index] += ft.norm();
-                    self.synthesized_frequency[index] =
-                        k as f32 * pitch_weight + oversampling_weight * delta_phase;
+
+                    self.synthesized_frequency[index] = k as f32 * pitch_weight
+                        + oversampling_weight * ((delta_phase + PI).rem_euclid(TAU) - PI);
+
+                    let mag = ft.norm();
+
+                    if self.pitch < 1.0 && index + 1 < half_frame_size {
+                        self.synthesized_magnitude[index] += mag * (1.0 - fract);
+                        self.synthesized_magnitude[index + 1] += mag * fract;
+                    } else {
+                        self.synthesized_magnitude[index] = mag;
+                    }
                 } else {
                     break;
                 }
@@ -167,7 +176,7 @@ impl PitchShifter {
 
             for k in 0..half_frame_size {
                 let phase = self.phase_sum[k] + mean_expected * self.synthesized_frequency[k];
-                self.phase_sum[k] = phase.rem_euclid(std::f32::consts::TAU);
+                self.phase_sum[k] = phase.rem_euclid(TAU);
 
                 let magnitude = self.synthesized_magnitude[k] * eq[k];
                 let (im, re) = phase.sin_cos();
@@ -179,10 +188,13 @@ impl PitchShifter {
             }
 
             // delete mirrored part of fft
+            // https://www.dsprelated.com/freebooks/sasp/fourier_transforms_continuous_discrete_time_frequency.html
+            // "Symmetry of the DTFT for Real Signals"
             self.fft_workspace[half_frame_size..].fill(Complex32::default());
 
             self.ifft.process(&mut self.fft_workspace);
 
+            // x2 for missing second half of fft
             let acc_oversampling = 2.0 / (half_frame_size * self.over_sampling) as f32;
 
             self.output_buffer[self.audio_index..self.audio_index + self.frame_size]
