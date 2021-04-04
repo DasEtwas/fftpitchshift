@@ -11,15 +11,19 @@ use std::sync::Arc;
 /// Methods used: constant overlap-add (COLA) adding to an output buffer from the inverse FFT of a frequency-domain scaled signal.
 #[derive(Clone)]
 pub struct PitchShifter {
-    input_buffer: Vec<f32>,
-    output_buffer: Vec<f32>,
-    fft_workspace: Vec<Complex32>,
-    last_phase: Vec<f32>,
-    phase_sum: Vec<f32>,
+    // permanent buffers
     window: Vec<f32>,
     mix_window: Vec<f32>,
-    synthesized_frequency: Vec<f32>,
-    synthesized_magnitude: Vec<f32>,
+    input_buffer: Vec<f32>,
+    output_buffer: Vec<f32>,
+    last_phase: Vec<f32>,
+    phase_sum: Vec<f32>,
+
+    // temporary buffers
+    fft_workspace: Vec<Complex32>,
+    analysed_frequency_magnitude: Vec<(f32, f32)>,
+    synthesis_frequency_magnitude: Vec<(f32, f32)>,
+
     frame_size: usize,
     step: usize,
     over_sampling: usize,
@@ -28,6 +32,7 @@ pub struct PitchShifter {
 
     audio_index: usize,
 
+    fft_scratch_buffer: Vec<Complex32>,
     fft: Arc<dyn Fft<f32>>,
     ifft: Arc<dyn Fft<f32>>,
 }
@@ -55,7 +60,10 @@ impl PitchShifter {
         assert_eq!(window.len(), frame_size);
         assert_eq!(mix_window.len(), frame_size);
 
-        let half_framesize = frame_size / 2 + 1;
+        let half_framesize = frame_size / 2;
+
+        let fft = FftPlanner::<f32>::new().plan_fft_forward(frame_size);
+        let ifft = FftPlanner::<f32>::new().plan_fft_inverse(frame_size);
 
         Self {
             input_buffer: vec![0.0; frame_size],
@@ -65,8 +73,8 @@ impl PitchShifter {
             fft_workspace: vec![Complex32::default(); frame_size],
             last_phase: vec![0.0; half_framesize],
             phase_sum: vec![0.0; half_framesize],
-            synthesized_frequency: vec![0.0; half_framesize],
-            synthesized_magnitude: vec![0.0; half_framesize],
+            analysed_frequency_magnitude: vec![Default::default(); half_framesize],
+            synthesis_frequency_magnitude: vec![Default::default(); half_framesize],
             frame_size,
             step: frame_size / over_sampling.get(),
             over_sampling: over_sampling.get(),
@@ -74,8 +82,13 @@ impl PitchShifter {
             pitch,
             audio_index: 0,
 
-            fft: FftPlanner::<f32>::new().plan_fft_forward(frame_size),
-            ifft: FftPlanner::<f32>::new().plan_fft_inverse(frame_size),
+            fft_scratch_buffer: vec![
+                Default::default();
+                fft.get_inplace_scratch_len()
+                    .max(ifft.get_inplace_scratch_len())
+            ],
+            fft,
+            ifft,
         }
     }
 
@@ -97,7 +110,7 @@ impl PitchShifter {
 
     // https://blogs.zynaptiq.com/bernsee/pitch-shifting-using-the-ft/
     // https://github.com/cpuimage/pitchshift/
-    /// * `eq`: List of frequency magnitude multipliers where index `0` corresponds to `0`hz and index `N` corresponds to `N/sample_rate` hz. Refer to the assert for the correct length.
+    /// * `eq`: List of bin magnitude coefficients where index `0` corresponds to `0`hz and index `N` corresponds to `N/sample_rate`hz. Refer to the assert for the correct length.
     /// * `input`: List of input samples. Can be of any length, but equal to `output`'s length.
     /// * `output`: List of output samples. Overlapping frames are summed in this buffer, be sure clear this buffer if no mixing is wanted.
     /// * `channels`: Set to != 1 to enable deinterlacing of input and output.
@@ -112,7 +125,7 @@ impl PitchShifter {
     ) {
         assert!(channel_index < channels.get());
         assert_eq!(input.len(), output.len());
-        assert_eq!(eq.len(), self.frame_size / 2 + 1);
+        assert_eq!(eq.len(), self.frame_size / 2);
 
         let sample_count = input.len() / channels;
 
@@ -121,13 +134,15 @@ impl PitchShifter {
         self.output_buffer
             .extend(output.iter().skip(channel_index).step_by(channels.get()));
 
-        let half_frame_size = self.frame_size / 2 + 1;
-        let bin_frequency_step = self.sample_rate as f32 / self.frame_size as f32;
-        let expected = TAU / self.over_sampling as f32;
-        let pitch_weight = self.pitch * bin_frequency_step;
-        let oversampling_weight =
-            (self.over_sampling as f32 / std::f32::consts::TAU) * pitch_weight;
-        let mean_expected = expected / bin_frequency_step;
+        let half_frame_size = self.frame_size / 2;
+        let delta_frequency_per_bin = self.sample_rate as f32 / self.frame_size as f32;
+        // expected phase increase per 1 frequency for one window length of audio
+        let phase_inc_per_hz_per_window = TAU / self.over_sampling as f32;
+        let oversampling_step_delta_phase_per_bin = (self.over_sampling as f32
+            / std::f32::consts::TAU)
+            * self.pitch
+            * delta_frequency_per_bin;
+        let phase_inc_per_bin_per_window = phase_inc_per_hz_per_window / delta_frequency_per_bin;
 
         while self.audio_index < self.input_buffer.len() - self.frame_size {
             self.fft_workspace
@@ -141,44 +156,87 @@ impl PitchShifter {
                     }
                 });
 
-            self.fft.process(&mut self.fft_workspace);
+            self.fft
+                .process_with_scratch(&mut self.fft_workspace, &mut self.fft_scratch_buffer);
 
-            self.synthesized_magnitude.fill(0.0);
-            self.synthesized_frequency.fill(0.0);
+            self.synthesis_frequency_magnitude.fill(Default::default());
+            self.analysed_frequency_magnitude.fill(Default::default());
+
+            let mut dps = 0.0;
 
             for k in 0..half_frame_size {
-                let findex = k as f32 * self.pitch;
-                let fract = findex.fract();
-                let index = findex.floor() as usize;
-                if index < half_frame_size {
-                    let ft = self.fft_workspace[k];
-                    let phase = ft.im.atan2(ft.re);
-                    // phase difference from last round
-                    let delta_phase = phase - self.last_phase[k] - k as f32 * expected;
+                let ft = self.fft_workspace[k];
+                let phase = ft.im.atan2(ft.re);
+                // phase difference from last round in +/-PI interval
+                let delta_phase =
+                    (phase - self.last_phase[k] - k as f32 * phase_inc_per_hz_per_window + PI)
+                        .rem_euclid(TAU)
+                        - PI;
 
-                    self.last_phase[k] = phase;
+                dps += delta_phase.abs();
 
-                    self.synthesized_frequency[index] = k as f32 * pitch_weight
-                        + oversampling_weight * ((delta_phase + PI).rem_euclid(TAU) - PI);
+                self.last_phase[k] = phase;
 
-                    let mag = ft.norm();
-
-                    if self.pitch < 1.0 && index + 1 < half_frame_size {
-                        self.synthesized_magnitude[index] += mag * (1.0 - fract);
-                        self.synthesized_magnitude[index + 1] += mag * fract;
-                    } else {
-                        self.synthesized_magnitude[index] = mag;
-                    }
-                } else {
-                    break;
-                }
+                self.analysed_frequency_magnitude[k] = (
+                    k as f32 * delta_frequency_per_bin
+                        + oversampling_step_delta_phase_per_bin * delta_phase,
+                    ft.norm(),
+                );
             }
 
-            for k in 0..half_frame_size {
-                let phase = self.phase_sum[k] + mean_expected * self.synthesized_frequency[k];
-                self.phase_sum[k] = phase.rem_euclid(TAU);
+            let synthesis_data = if self.pitch > 1.0 {
+                for synthesis_bin_idx in 0..half_frame_size {
+                    let findex = synthesis_bin_idx as f32 / self.pitch;
+                    let analysis_bin_idx = findex.round() as usize;
 
-                let magnitude = self.synthesized_magnitude[k] * eq[k];
+                    // mix overlapping freq and mag
+                    if analysis_bin_idx < half_frame_size {
+                        let (analysis_freq, analysis_mag) =
+                            &mut self.analysed_frequency_magnitude[analysis_bin_idx];
+                        let (synthesis_freq, synthesis_mag) =
+                            &mut self.synthesis_frequency_magnitude[synthesis_bin_idx];
+
+                        *synthesis_mag = *analysis_mag;
+                        *synthesis_freq = *analysis_freq * self.pitch;
+                    } else {
+                        break;
+                    }
+                }
+
+                &self.synthesis_frequency_magnitude
+            } else if self.pitch < 1.0 {
+                for analysis_bin_idx in 0..half_frame_size {
+                    let findex = analysis_bin_idx as f32 * self.pitch;
+                    let synthesis_bin_idx = findex.round() as usize;
+
+                    // interleaved-zero-padding the fft
+                    if synthesis_bin_idx < half_frame_size {
+                        let (analysis_freq, analysis_mag) =
+                            &mut self.analysed_frequency_magnitude[analysis_bin_idx];
+                        let (synthesis_freq, synthesis_mag) =
+                            &mut self.synthesis_frequency_magnitude[synthesis_bin_idx];
+
+                        *synthesis_mag = *analysis_mag;
+                        *synthesis_freq = *analysis_freq * self.pitch;
+                    } else {
+                        break;
+                    }
+                }
+
+                &self.synthesis_frequency_magnitude
+            } else {
+                // pitch == 1.0
+                &self.analysed_frequency_magnitude
+            };
+
+            for k in 0..half_frame_size {
+                let (freq, mag) = synthesis_data[k];
+
+                let phase =
+                    (self.phase_sum[k] + phase_inc_per_bin_per_window * freq).rem_euclid(TAU);
+                self.phase_sum[k] = phase;
+
+                let magnitude = eq[k] * mag;
                 let (im, re) = phase.sin_cos();
 
                 self.fft_workspace[k] = Complex32 {
@@ -187,12 +245,29 @@ impl PitchShifter {
                 };
             }
 
-            // delete mirrored part of fft
+            fn asciiboner(size: usize, position: usize) -> String {
+                (0..position)
+                    .map(|_| ' ')
+                    .chain(std::iter::once('#'))
+                    .chain((position + 1..size).map(|_| ' '))
+                    .collect()
+            }
+
+            println!(
+                "0hz phase: {}, delta phase sum: {} soos {}#",
+                asciiboner(32, (self.phase_sum[0] / TAU * 31.9) as usize),
+                asciiboner(50, (dps / 1000.0 * 49.9) as usize),
+                (0..(self.phase_sum.iter().sum::<f32>() / 5000.0 * 30.0) as usize)
+                    .map(|_| ' ')
+                    .collect::<String>()
+            );
+
             // https://www.dsprelated.com/freebooks/sasp/fourier_transforms_continuous_discrete_time_frequency.html
             // "Symmetry of the DTFT for Real Signals"
-            self.fft_workspace[half_frame_size..].fill(Complex32::default());
+            self.fft_workspace[self.frame_size / 2..].fill(Complex32::default());
 
-            self.ifft.process(&mut self.fft_workspace);
+            self.ifft
+                .process_with_scratch(&mut self.fft_workspace, &mut self.fft_scratch_buffer);
 
             // x2 for missing second half of fft
             let acc_oversampling = 2.0 / (half_frame_size * self.over_sampling) as f32;
